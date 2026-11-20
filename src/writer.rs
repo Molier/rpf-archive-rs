@@ -127,6 +127,7 @@ impl RpfBuilder {
             RpfVersion::Img3 => self.build_img3(),
             RpfVersion::Img1 => bail!("IMG1 produces two files — use build_img1_pair() instead"),
             RpfVersion::V8   => bail!("RPF8 write not supported (requires TFIT keys + RSA signing)"),
+            RpfVersion::V9   => bail!("RPF9 write not supported (TOC encryption scheme unknown)"),
         }
     }
 

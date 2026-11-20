@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use std::{fs, path::Path};
 
 use crate::crypto::{decrypt_aes, decrypt_ng, GtaKeys};
+use crate::rpf9::{scan_zlib_streams, CarvedStream, Rpf9Header, ScanOptions};
+pub use crate::rpf9::RPF9_MAGIC;
 
 pub const RPF0_MAGIC: u32 = 0x30465052; // Table Tennis
 pub const RPF2_MAGIC: u32 = 0x32465052; // GTA IV
@@ -10,6 +12,7 @@ pub const RPF4_MAGIC: u32 = 0x34465052; // Max Payne 3
 pub const RPF6_MAGIC: u32 = 0x36465052; // Red Dead Redemption
 pub const RPF7_MAGIC: u32 = 0x52504637; // GTA V
 pub const RPF8_MAGIC: u32 = 0x52504638; // Red Dead Redemption 2 (PC/y platform)
+// RPF9_MAGIC (0x52504639, "9FPR" on disk) is defined in rpf9.rs and re-exported above.
 pub const RSC7_MAGIC: u32 = 0x37435352;
 pub const RSC8_MAGIC: u32 = 0x38435352;
 pub const IMG2_MAGIC: u32 = 0x32524556; // GTA SA (IMG v2) — "VER2"
@@ -26,6 +29,7 @@ pub enum RpfVersion {
     V6,   // Red Dead Redemption — big-endian 20-byte entries, offsets * 8
     V7,   // GTA V / FiveM — AES or NG encryption, 512-byte block offsets
     V8,   // Red Dead Redemption 2 — TFIT cipher, 24-byte entries, hash names
+    V9,   // "9FPR" — encrypted TOC (scheme unknown); header only, see rpf9.rs
     Img1, // GTA III / Vice City — paired .dir+.img, no magic, 32-byte entries
     Img2, // GTA San Andreas — single .img with "VER2" magic
     Img3, // RAGE IMG v3 (modding/IV-era) — 0xA94E2A52 magic
@@ -40,6 +44,7 @@ pub enum RpfEncryption {
     Aes,
     Ng,
     Tfit, // RPF8 TFIT cipher (keys not held)
+    Unknown, // encrypted with a scheme this crate does not know (RPF9 TOC)
 }
 
 impl RpfEncryption {
@@ -60,11 +65,12 @@ impl RpfEncryption {
             Self::Aes  => 0x0FFFFFF9,
             Self::Ng   => 0x0FEFFFFF,
             Self::Tfit => 0x00000000,
+            Self::Unknown => 0x00000000,
         }
     }
 
     pub fn is_encrypted(self) -> bool {
-        matches!(self, Self::Aes | Self::Ng | Self::Tfit)
+        matches!(self, Self::Aes | Self::Ng | Self::Tfit | Self::Unknown)
     }
 }
 
@@ -146,6 +152,7 @@ impl RpfArchive {
             RPF6_MAGIC => RpfVersion::V6,
             RPF7_MAGIC => RpfVersion::V7,
             RPF8_MAGIC => RpfVersion::V8,
+            RPF9_MAGIC => RpfVersion::V9,
             IMG2_MAGIC => RpfVersion::Img2,
             IMG3_MAGIC => RpfVersion::Img3,
             _ => bail!("unknown archive magic: {:#010x}", magic),
@@ -156,6 +163,7 @@ impl RpfArchive {
             RpfVersion::V0   => parse_rpf0_toc(d)?,
             RpfVersion::V6   => parse_rpf6_toc(d)?,
             RpfVersion::V8   => parse_rpf8_toc(d)?,
+            RpfVersion::V9   => parse_rpf9_toc(d)?,
             RpfVersion::Img2 => parse_img2_toc(d)?,
             RpfVersion::Img3 => parse_img3_toc(d)?,
             _                => parse_rpf2_toc(d, version)?,
@@ -443,6 +451,9 @@ impl RpfArchive {
             RpfEncryption::Tfit => {
                 bail!("TFIT decryption is not supported (RDR2 keys not held)")
             }
+            RpfEncryption::Unknown => {
+                bail!("unknown encryption scheme, cannot decrypt")
+            }
             _ => Ok(data.to_vec()),
         }
     }
@@ -501,6 +512,21 @@ impl RpfFile {
 
     pub fn raw_data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// The RPF9 header, if this is an RPF9 archive.
+    pub fn rpf9_header(&self) -> Option<Rpf9Header> {
+        if self.archive.version != RpfVersion::V9 { return None; }
+        Rpf9Header::parse(self.data.get(self.archive.start_offset..)?).ok()
+    }
+
+    /// Carve every intact zlib stream out of the archive, TOC or no TOC.
+    /// Offsets are relative to the start of the archive. This is how to get
+    /// at RPF9 contents while the TOC can't be decrypted. See
+    /// [`crate::rpf9::scan_zlib_streams`].
+    pub fn scan_zlib_streams(&self, opts: &ScanOptions) -> Vec<CarvedStream> {
+        let d = self.data.get(self.archive.start_offset..).unwrap_or(&[]);
+        scan_zlib_streams(d, opts)
     }
 }
 
@@ -974,6 +1000,25 @@ fn parse_rpf8_entries(entries_data: &[u8], count: usize) -> Result<Vec<RpfEntry>
         entries.push(RpfEntry { name, name_lower, kind });
     }
     Ok(entries)
+}
+
+// ─── RPF9 TOC ────────────────────────────────────────────────────────────────
+
+/// The RPF9 TOC is encrypted with a scheme this crate doesn't know, so this
+/// checks the plaintext header and returns no entries. Use
+/// [`RpfFile::scan_zlib_streams`] or [`crate::rpf9::scan_zlib_streams`] to
+/// carve the file bodies instead.
+fn parse_rpf9_toc(d: &[u8]) -> Result<(Vec<RpfEntry>, RpfEncryption)> {
+    let header = Rpf9Header::parse(d)?;
+    if header.toc_end as usize > d.len() {
+        bail!("RPF9 TOC truncated (toc_end {:#x}, file {:#x})", header.toc_end, d.len());
+    }
+    eprintln!(
+        "[RPF9] encrypted TOC ({:#x} bytes at 0x40): scheme unknown, listing no entries; \
+         use scan_zlib_streams to carve the contents",
+        header.toc_len()
+    );
+    Ok((Vec::new(), RpfEncryption::Unknown))
 }
 
 // ─── IMG1 TOC ────────────────────────────────────────────────────────────────
