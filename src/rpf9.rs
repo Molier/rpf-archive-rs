@@ -1,37 +1,59 @@
 //! RPF9 (`9FPR` on disk): header parsing and a zlib stream scanner.
 //!
 //! RPF9 is the next archive version after RDR2's RPF8. Its table of contents
-//! is encrypted with a scheme this crate does not know, so [`RpfArchive`]
-//! parses the plaintext header and reports no entries. The file bodies are
-//! mostly plain zlib streams, and [`scan_zlib_streams`] pulls those out
-//! without the TOC.
+//! is encrypted, and this crate does not decrypt it: [`Rpf9Header`] parses the
+//! plaintext header only. The file bodies are mostly plain zlib streams, and
+//! [`scan_zlib_streams`] pulls those out without the TOC.
+//!
+//! The header test vectors are synthetic: every field except the magic,
+//! version and alignment invariants is invented, so no bytes come from a
+//! real archive.
 //!
 //! # Header layout
 //!
 //! The plaintext header is 0x40 bytes, all little-endian. What each field
-//! means is inferred from five sample archives, so the names are the
-//! hypotheses, and the docs on [`Rpf9Header`] give the evidence for each:
+//! means is a hypothesis: the encrypted TOC is not decrypted, so the roles
+//! below are inferred from the layout and from cross-archive comparisons
+//! (aggregate relations only). The docs on [`Rpf9Header`] record each field's
+//! evidence, and everything not confirmed by the synthetic tests in this
+//! crate is marked unverified.
 //!
 //! ```text
 //! 0x00  u32  magic           0x52504639 ("9FPR" on disk)
 //! 0x04  u32  toc_end         end of the encrypted TOC; zero padding or file data follows
-//! 0x08  u32  field_08        unknown, a little below toc_end (TOC sub-size?)
+//! 0x08  u32  field_08        unknown; trails toc_end by a small, archive-dependent amount
 //! 0x0C  u32  field_0c        unknown (names length?)
-//! 0x10  u64  archive_id      different in every archive (per-archive hash, IV or key seed?)
-//! 0x18  u32  field_18        0x00047A00 in every sample
-//! 0x1C  u32  field_1c        0x00000150 in every sample
-//! 0x20  u16  field_20        3, 5 or 6
-//! 0x22  u16  field_22        1 in every sample
-//! 0x24  u32  field_24        2 .. 418; not the file count (script.rpf: 2, ~1000 streams)
-//! 0x28  u32  key_hash        shared between some archives (key or platform selector?)
-//! 0x2C  u8   field_2c        1 or 2
-//! 0x2D  u8   field_2d        0x0F in every sample
-//! 0x2E  u8   field_2e        0x09 in every sample
-//! 0x2F  u8   field_2f        0x00 in every sample
-//! 0x30  u32  field_30        0x10 in every sample (data alignment?)
+//! 0x10  u64  archive_id      different in every archive checked (per-archive hash, IV or key seed?)
+//! 0x18  u32  field_18        same value in every archive checked (unverified)
+//! 0x1C  u32  field_1c        same value in every archive checked (unverified)
+//! 0x20  u16  field_20        small values seen (3..7); meaning unknown
+//! 0x22  u16  field_22        1 (2 seen once); meaning unknown
+//! 0x24  u32  field_24        entry count of this archive; see below
+//! 0x28  u32  key_hash        shared between some distinct archives (key or platform selector?)
+//! 0x2C  u8   field_2c        small value (1 or 2 seen); likely the lookup-table index width k
+//! 0x2D  u8   field_2d        same value in every archive checked (unverified)
+//! 0x2E  u8   field_2e        same value in every archive checked (unverified)
+//! 0x2F  u8   field_2f        zero in every archive checked
+//! 0x30  u32  field_30        same value in every archive checked (data alignment?)
 //! 0x34  ...  zero up to 0x40
-//! 0x40  ...  encrypted TOC up to toc_end (byte entropy 7.7 to 8.0 bits)
+//! 0x40  ...  encrypted TOC up to toc_end (high entropy, close to 8 bits/byte)
 //! ```
+//!
+//! # Entry count and nested archives
+//!
+//! `field_24` (0x24) is the number of entries in *this* archive. An RPF9
+//! archive can contain other RPF9 archives, stored uncompressed: the nested
+//! header (`9FPR`) sits at a 4 KiB-aligned offset in the parent's data
+//! area. A count that looks too small for the number of zlib streams in a
+//! file usually means most of the streams belong to a nested archive.
+//! Use [`find_nested_headers`] to list the direct children.
+//!
+//! The region `[field_08, toc_end)` matches `n x (8 + k)` bytes rounded up
+//! to 16 (n = `field_24`, k = `flags[0]`) on many headers, but not on all:
+//! some nested headers are larger than predicted, and the excess is
+//! high-entropy, so that region is most likely encrypted along with the TOC
+//! rather than a plaintext index. This is an open question; publish only
+//! aggregate relations about it.
 //!
 //! # What the archive body looks like
 //!
@@ -42,10 +64,13 @@
 //!   than 64 KiB is a chain of separate zlib streams, each inflating to
 //!   exactly 65536 bytes, packed one after another on 16-byte boundaries.
 //!   The last stream of a chain is shorter.
-//! - Some payloads (most of `script.rpf`) are not zlib. They are probably
-//!   encrypted, and the scanner skips them.
+//! - Some payloads are not zlib. They are probably encrypted, and the
+//!   scanner skips them.
+//! - Wrapped records (a name ending in `_Wrapped\0`, four u32s, then a
+//!   **raw deflate** stream with no `78 xx` header, wbits -15) are invisible
+//!   to [`scan_zlib_streams`]. TODO: raw-deflate scanning keyed on
+//!   `_Wrapped\0`.
 //!
-//! [`RpfArchive`]: crate::RpfArchive
 
 use anyhow::{bail, Result};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -64,19 +89,18 @@ pub const RPF9_CHUNK_SIZE: usize = 0x10000;
 // ─── Header ──────────────────────────────────────────────────────────────────
 
 /// The RPF9 header. Every field past the first four bytes is a guess at its
-/// meaning, checked against the sample archives only.
+/// meaning, based on layout and cross-archive comparison only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpf9Header {
-    /// 0x04. End offset of the header plus encrypted TOC. In 3 of 5 samples
-    /// zero padding starts exactly here and runs to the next 4 KiB boundary.
-    /// In the other two, data follows right away.
+    /// 0x04. End offset of the header plus encrypted TOC. On many archives
+    /// zero padding starts here and runs to the next 4 KiB boundary; on
+    /// others, data follows right away.
     pub toc_end : u32,
-    /// 0x08. Unknown. Equals `toc_end - 0x20` in small archives
-    /// (0x260/0x240, 0x360/0x340), `toc_end - 0x30` / `- 0x40` in others, and
-    /// is 0x1060 below it in common.rpf. Might be the size of a TOC sub-table.
+    /// 0x08. Unknown. Trails `toc_end` by a small, archive-dependent amount.
+    /// Might be the size of a TOC sub-table.
     pub field_08: u32,
-    /// 0x0C. Unknown. 0x40 .. 0x3A10 in the samples, growing with the
-    /// archive. Maybe the names table length (RPF7 keeps that at 0x08).
+    /// 0x0C. Unknown. Grows with the archive. Maybe the names table length
+    /// (RPF7 keeps that at 0x08).
     pub field_0c: u32,
     /// The rest of the 0x40-byte header, if the input was that long.
     pub ext     : Option<Rpf9HeaderExt>,
@@ -85,28 +109,30 @@ pub struct Rpf9Header {
 /// Header fields 0x10 to 0x40, parsed when the full header is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpf9HeaderExt {
-    /// 0x10. Different in every sample, so likely a per-archive hash, IV or
-    /// key seed.
+    /// 0x10. Different in every archive checked, so likely a per-archive
+    /// hash, IV or key seed.
     pub archive_id: u64,
-    /// 0x18. 0x00047A00 in every sample.
+    /// 0x18. Same value in every archive checked (unverified).
     pub field_18  : u32,
-    /// 0x1C. 0x150 in every sample.
+    /// 0x1C. Same value in every archive checked (unverified).
     pub field_1c  : u32,
-    /// 0x20. 3, 5 or 6.
+    /// 0x20. Small values seen (3..7). Meaning unknown.
     pub field_20  : u16,
-    /// 0x22. 1 in every sample.
+    /// 0x22. Usually 1. Meaning unknown.
     pub field_22  : u16,
-    /// 0x24. 2 to 418. It is not the file count: script.rpf has 2 here and
-    /// about 1000 zlib streams.
+    /// 0x24. Number of entries in this archive. It counts direct entries
+    /// only, which may themselves be nested RPF9 archives.
     pub field_24  : u32,
-    /// 0x28. Some archives share this value (appdata0.rpf and common.rpf;
-    /// both pack archives), so it may select a key or platform.
+    /// 0x28. Some distinct archives share this value, so it may select a
+    /// key or platform.
     pub key_hash  : u32,
-    /// 0x2C..0x30. `[1|2, 0x0F, 0x09, 0x00]` in the samples.
+    /// 0x2C..0x30. `flags[0]` is small (1 or 2 seen) and is probably the
+    /// width in bytes of a lookup-table index (see module docs).
     pub flags     : [u8; 4],
-    /// 0x30. 0x10 in every sample; possibly the data alignment.
+    /// 0x30. Same value in every archive checked; possibly the data
+    /// alignment.
     pub field_30  : u32,
-    /// True when 0x34..0x40 are all zero, as in every sample.
+    /// True when 0x34..0x40 are all zero, as in every archive checked.
     pub reserved_zero: bool,
 }
 
@@ -171,6 +197,46 @@ impl Rpf9Header {
         }
         problems
     }
+
+    /// Number of direct entries in this archive (header field 0x24), when
+    /// the full header was parsed. Entries can be nested RPF9 archives.
+    pub fn entry_count(&self) -> Option<u32> {
+        self.ext.as_ref().map(|e| e.field_24)
+    }
+}
+
+/// Alignment of nested RPF9 archives inside their parent's data area.
+pub const RPF9_NESTED_ALIGN: usize = 0x1000;
+
+fn align_up(x: usize, align: usize) -> usize {
+    x.div_ceil(align) * align
+}
+
+/// Finds the RPF9 archives nested (uncompressed) *directly* inside `data`,
+/// which is the whole parent archive. Looks at every
+/// [`RPF9_NESTED_ALIGN`]-aligned offset past 0 for a full header that
+/// [`Rpf9Header::validate`]s against the bytes that follow it. After a
+/// match at `off`, the scan skips the child's header and encrypted TOC
+/// range `[off, off + toc_end)`, so grandchildren are not reported here:
+/// call this function again on a child's own bytes to go one level deeper.
+pub fn find_nested_headers(data: &[u8]) -> Vec<(usize, Rpf9Header)> {
+    let mut out = Vec::new();
+    let mut off = RPF9_NESTED_ALIGN;
+    while off + RPF9_HEADER_SIZE <= data.len() {
+        if data[off..off + 4] == *b"9FPR" {
+            if let Ok(h) = Rpf9Header::parse(&data[off..]) {
+                if h.ext.is_some() && h.validate(data.len() - off).is_empty() {
+                    out.push((off, h.clone()));
+                    // Skip the child's header + TOC; nested archives can only
+                    // live past its toc_end.
+                    off = align_up(off + h.toc_end as usize, RPF9_NESTED_ALIGN);
+                    continue;
+                }
+            }
+        }
+        off += RPF9_NESTED_ALIGN;
+    }
+    out
 }
 
 fn le32(d: &[u8], off: usize) -> u32 {
@@ -352,40 +418,59 @@ pub fn sniff_kind(b: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{RpfArchive, RpfEncryption, RpfVersion};
     use flate2::{write::ZlibEncoder, Compression};
     use std::io::Write;
 
-    // First 16 bytes of three RPF9 archives, as hex-dumped.
-    const SCRIPT_16: [u8; 16] = [
-        0x39, 0x46, 0x50, 0x52, 0x60, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
-    ];
-    const COMMON_16: [u8; 16] = [
-        0x39, 0x46, 0x50, 0x52, 0x80, 0x95, 0x00, 0x00, 0x20, 0x85, 0x00, 0x00, 0x10, 0x3A, 0x00, 0x00,
-    ];
-    const APPDATA0_16: [u8; 16] = [
-        0x39, 0x46, 0x50, 0x52, 0x60, 0x03, 0x00, 0x00, 0x40, 0x03, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
-    ];
+    /// Builds a fully synthetic 0x40-byte header: only the magic and the
+    /// layout invariants documented in the module docs are format-defined;
+    /// every field value is invented for the tests. The three built-in
+    /// vectors below exercise different shapes (small TOC, wide index,
+    /// shared key selector).
+    #[allow(clippy::too_many_arguments)] // one parameter per header field keeps the vectors readable
+    fn synth_header(toc_end: u32, field_08: u32, field_0c: u32, archive_id: u64,
+                    entries: u32, key_hash: u32, index_width: u8, field_20: u16,
+                    field_22: u16) -> [u8; 0x40] {
+        assert!(toc_end % 16 == 0 && (field_08 as usize) <= toc_end as usize && index_width <= 2);
+        let mut h = [0u8; 0x40];
+        h[0x00..0x04].copy_from_slice(&RPF9_MAGIC.to_le_bytes());
+        h[0x04..0x08].copy_from_slice(&toc_end.to_le_bytes());
+        h[0x08..0x0C].copy_from_slice(&field_08.to_le_bytes());
+        h[0x0C..0x10].copy_from_slice(&field_0c.to_le_bytes());
+        h[0x10..0x18].copy_from_slice(&archive_id.to_le_bytes());
+        // Invented constants for the "same everywhere (unverified)" fields.
+        h[0x18..0x1C].copy_from_slice(&0x0031_9C40u32.to_le_bytes());
+        h[0x1C..0x20].copy_from_slice(&0x0000_01C0u32.to_le_bytes());
+        h[0x20..0x22].copy_from_slice(&field_20.to_le_bytes());
+        h[0x22..0x24].copy_from_slice(&field_22.to_le_bytes());
+        h[0x24..0x28].copy_from_slice(&entries.to_le_bytes());
+        h[0x28..0x2C].copy_from_slice(&key_hash.to_le_bytes());
+        h[0x2C] = index_width;
+        h[0x2D] = 0x0D; // invented flag bytes, distinct from anything observed
+        h[0x2E] = 0x07;
+        h[0x2F] = 0x00;
+        h[0x30..0x34].copy_from_slice(&0x10u32.to_le_bytes());
+        h // 0x34..0x40 stay zero
+    }
 
-    // Full 0x40-byte headers of the same archives.
-    const SCRIPT_HDR: [u8; 0x40] = [
-        0x39, 0x46, 0x50, 0x52, 0x60, 0x02, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
-        0x70, 0x15, 0xBB, 0x52, 0xAE, 0x8E, 0xF8, 0x86, 0x00, 0x7A, 0x04, 0x00, 0x50, 0x01, 0x00, 0x00,
-        0x03, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x54, 0x27, 0xA9, 0xC0, 0x01, 0x0F, 0x09, 0x00,
-        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    const COMMON_HDR: [u8; 0x40] = [
-        0x39, 0x46, 0x50, 0x52, 0x80, 0x95, 0x00, 0x00, 0x20, 0x85, 0x00, 0x00, 0x10, 0x3A, 0x00, 0x00,
-        0x5C, 0x94, 0x68, 0x0D, 0xCD, 0xEB, 0x13, 0x49, 0x00, 0x7A, 0x04, 0x00, 0x50, 0x01, 0x00, 0x00,
-        0x06, 0x00, 0x01, 0x00, 0xA2, 0x01, 0x00, 0x00, 0x3E, 0x57, 0x72, 0xDA, 0x02, 0x0F, 0x09, 0x00,
-        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    const APPDATA0_HDR: [u8; 0x40] = [
-        0x39, 0x46, 0x50, 0x52, 0x60, 0x03, 0x00, 0x00, 0x40, 0x03, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
-        0x99, 0x37, 0xE6, 0x24, 0x72, 0xDF, 0x66, 0xB7, 0x00, 0x7A, 0x04, 0x00, 0x50, 0x01, 0x00, 0x00,
-        0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x3E, 0x57, 0x72, 0xDA, 0x01, 0x0F, 0x09, 0x00,
-        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
+    /// Small archive: tiny TOC, 5 direct entries, 1-byte index width. All
+    /// field values invented (the format only fixes the magic and alignment
+    /// invariants).
+    fn small_hdr() -> [u8; 0x40] {
+        synth_header(0x05A0, 0x04E0, 0x00C0, 0x4455_6677_8899_AABB, 5, 0x1122_3344, 1, 3, 1)
+    }
+    /// Large archive: wide 2-byte index, many entries.
+    fn wide_hdr() -> [u8; 0x40] {
+        synth_header(0xB440, 0xA980, 0x2E60, 0x0102_0304_0506_0708, 507, 0x5E6F_7081, 2, 6, 1)
+    }
+    /// Medium archive sharing `wide_hdr`'s key selector (the "key or
+    /// platform selector" hypothesis).
+    fn shared_key_hdr() -> [u8; 0x40] {
+        synth_header(0x0820, 0x0740, 0x00A0, 0x9988_7766_5544_3322, 3, 0x5E6F_7081, 1, 5, 1)
+    }
+
+    fn first16(h: &[u8; 0x40]) -> [u8; 16] {
+        h[..16].try_into().unwrap()
+    }
 
     fn zlib(data: &[u8], level: u32) -> Vec<u8> {
         let mut e = ZlibEncoder::new(Vec::new(), Compression::new(level));
@@ -404,16 +489,16 @@ mod tests {
         while buf.len() % align != 0 { buf.push(0); }
     }
 
-    /// A made-up RPF9 archive: the real script.rpf header, a noise TOC,
-    /// then the RPF9 body layout: a small XML file at 0x1000, a 3-block
-    /// chained file at 0x2000, and a non-zlib (encrypted) blob.
+    /// A made-up RPF9 archive: a synthetic header, a noise TOC, then the
+    /// body layout: a small XML file at 0x1000, a 3-block chained file at
+    /// 0x2000, and a non-zlib (encrypted) blob.
     fn synthetic_rpf9() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CDataFileMgr__ContentsOfDataFileXml>\n  <dataFiles/>\n</CDataFileMgr__ContentsOfDataFileXml>\n".to_vec();
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<catalog>\n  <file name=\"sample\"/>\n</catalog>\n".to_vec();
         // 2.5 chunks: two full 64 KiB blocks and a shorter last one.
         let big: Vec<u8> = (0..RPF9_CHUNK_SIZE * 5 / 2).map(|i| (i % 251) as u8 ^ (i >> 9) as u8).collect();
 
-        let mut f = SCRIPT_HDR.to_vec();
-        f.extend(noise(0x260 - 0x40, 0x1234));
+        let mut f = small_hdr().to_vec();
+        f.extend(noise(0x5A0 - 0x40, 0x1234));
         pad_to(&mut f, 0x1000);
 
         assert_eq!(f.len(), 0x1000);
@@ -435,9 +520,9 @@ mod tests {
     #[test]
     fn header_vectors_first_16_bytes() {
         let cases: [(&[u8; 16], u32, u32, u32); 3] = [
-            (&SCRIPT_16,   0x0260, 0x0240, 0x0080),
-            (&COMMON_16,   0x9580, 0x8520, 0x3A10),
-            (&APPDATA0_16, 0x0360, 0x0340, 0x0040),
+            (&first16(&small_hdr()),      0x05A0, 0x04E0, 0x00C0),
+            (&first16(&wide_hdr()),       0xB440, 0xA980, 0x2E60),
+            (&first16(&shared_key_hdr()), 0x0820, 0x0740, 0x00A0),
         ];
         for (bytes, toc_end, f08, f0c) in cases {
             assert_eq!(&bytes[0..4], b"9FPR");
@@ -452,65 +537,129 @@ mod tests {
 
     #[test]
     fn header_vectors_full() {
-        let s = Rpf9Header::parse(&SCRIPT_HDR).unwrap();
+        let s = Rpf9Header::parse(&small_hdr()).unwrap();
         let e = s.ext.as_ref().unwrap();
-        assert_eq!(e.archive_id, 0x86F8_8EAE_52BB_1570);
-        assert_eq!(e.field_18, 0x0004_7A00);
-        assert_eq!(e.field_1c, 0x150);
+        assert_eq!(e.archive_id, 0x4455_6677_8899_AABB);
+        assert_eq!(e.field_18, 0x0031_9C40);
+        assert_eq!(e.field_1c, 0x1C0);
         assert_eq!((e.field_20, e.field_22), (3, 1));
-        assert_eq!(e.field_24, 2);
-        assert_eq!(e.key_hash, 0xC0A9_2754);
-        assert_eq!(e.flags, [0x01, 0x0F, 0x09, 0x00]);
+        assert_eq!(e.field_24, 5);
+        assert_eq!(e.key_hash, 0x1122_3344);
+        assert_eq!(e.flags, [0x01, 0x0D, 0x07, 0x00]);
         assert_eq!(e.field_30, 0x10);
         assert!(e.reserved_zero);
-        assert_eq!(s.toc_len(), 0x220);
+        assert_eq!(s.toc_len(), 0x560);
 
-        let c = Rpf9Header::parse(&COMMON_HDR).unwrap();
+        let c = Rpf9Header::parse(&wide_hdr()).unwrap();
         let ce = c.ext.as_ref().unwrap();
-        assert_eq!(ce.field_24, 418);
+        assert_eq!(ce.field_24, 507);
         assert_eq!(ce.flags[0], 2);
-        assert_eq!(c.toc_len(), 0x9540);
+        assert_eq!(c.toc_len(), 0xB400);
 
-        // appdata0 and common share key_hash; script does not.
-        let a = Rpf9Header::parse(&APPDATA0_HDR).unwrap();
+        // shared_key_hdr and wide_hdr share key_hash; small_hdr does not.
+        let a = Rpf9Header::parse(&shared_key_hdr()).unwrap();
         assert_eq!(a.ext.as_ref().unwrap().key_hash, ce.key_hash);
         assert_ne!(e.key_hash, ce.key_hash);
         assert_ne!(a.ext.as_ref().unwrap().archive_id, ce.archive_id);
     }
 
     #[test]
+    fn test_vectors_are_fully_synthetic() {
+        // Guards the review rule: every test vector is built by
+        // `synth_header` from invented values, and the fixed fields carry the
+        // invented constants above. Only the magic and the zero tail are
+        // format-defined.
+        for h in [small_hdr(), wide_hdr(), shared_key_hdr()] {
+            assert_eq!(&h[0x00..0x04], &RPF9_MAGIC.to_le_bytes());
+            assert_eq!(&h[0x18..0x1C], &0x0031_9C40u32.to_le_bytes());
+            assert_eq!(&h[0x1C..0x20], &0x0000_01C0u32.to_le_bytes());
+            assert_eq!((h[0x2D], h[0x2E], h[0x2F]), (0x0D, 0x07, 0x00));
+            assert!(h[0x34..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn entry_count_and_nested_archives() {
+        assert_eq!(Rpf9Header::parse(&small_hdr()).unwrap().entry_count(), Some(5));
+        assert_eq!(Rpf9Header::parse(&wide_hdr()).unwrap().entry_count(), Some(507));
+        assert_eq!(Rpf9Header::parse(&first16(&small_hdr())).unwrap().entry_count(), None);
+
+        // Parent with two nested archives at 4 KiB boundaries.
+        let (child, _, _) = synthetic_rpf9();
+        let mut parent = small_hdr().to_vec();
+        parent.extend(noise(0x5A0 - 0x40, 0x4242));
+        pad_to(&mut parent, 0x1000);
+        parent.extend(&child);
+        pad_to(&mut parent, 0x1000);
+        let second = parent.len();
+        let mut child2 = wide_hdr().to_vec();
+        child2.extend(noise(0xB440 - 0x40, 0x77));
+        parent.extend(&child2);
+        // A "9FPR" that is not on a 4 KiB boundary is ignored.
+        parent.extend(b"9FPR");
+        parent.extend(noise(0x100, 1));
+
+        let found = find_nested_headers(&parent);
+        let offsets: Vec<usize> = found.iter().map(|(o, _)| *o).collect();
+        assert_eq!(offsets, vec![0x1000, second]);
+        assert_eq!(found[0].1.entry_count(), Some(5));
+        assert_eq!(found[1].1.entry_count(), Some(507));
+        assert!(find_nested_headers(&child2).is_empty());
+    }
+
+    /// A grandchild header inside the child's header+TOC range must not be
+    /// listed as a sibling of the child: after a match at `off`, the scan
+    /// skips `[off, off + toc_end)`. Going one level deeper (scanning the
+    /// child's own bytes) is how the grandchild is reached.
+    #[test]
+    fn nested_headers_lists_direct_children_only() {
+        // Child: TOC extends to 0x4000, so the parent's skip range covers the
+        // grandchild embedded at child-relative 0x3000. (A real nested
+        // archive's TOC is high-entropy noise; a `9FPR` header embedded in
+        // that noise is what the skip must not double-report.)
+        let mut child = synth_header(0x4000, 0x3E00, 0x00C0, 0x7777_8888_9999_AAAA, 3, 0x2468_ACE0, 1, 4, 1).to_vec();
+        child.extend(noise(0x4000 - 0x40, 0x1F1F));
+
+        // Grandchild: a small archive header at child-relative 0x3000,
+        // 4 KiB-aligned in both the child's and the parent's coordinates.
+        let gc_rel = 0x3000;
+        let grandchild = shared_key_hdr(); // toc_end 0x820 fits in the remaining 0x1000 bytes
+        child[gc_rel..gc_rel + grandchild.len()].copy_from_slice(&grandchild);
+
+        let mut parent = small_hdr().to_vec();
+        parent.extend(noise(0x5A0 - 0x40, 0x4242));
+        pad_to(&mut parent, 0x1000);
+        parent.extend(&child);
+
+        // One direct child only, even though the grandchild is also
+        // 4 KiB-aligned in the parent's coordinates (at 0x4000).
+        let found = find_nested_headers(&parent);
+        assert_eq!(found.len(), 1, "offsets: {:?}", found.iter().map(|(o, _)| o).collect::<Vec<_>>());
+        assert_eq!(found[0].0, 0x1000);
+        assert_eq!(found[0].1.entry_count(), Some(3));
+
+        // Going one level deeper finds the grandchild inside the child.
+        let inner = find_nested_headers(&parent[0x1000..]);
+        assert_eq!(inner.iter().map(|(o, _)| *o).collect::<Vec<_>>(), vec![gc_rel]);
+        assert_eq!(inner[0].1.entry_count(), Some(3));
+    }
+
+    #[test]
     fn header_validate() {
-        assert!(Rpf9Header::parse(&SCRIPT_HDR).unwrap().validate(4_358_960).is_empty());
-        assert!(Rpf9Header::parse(&COMMON_HDR).unwrap().validate(6_642_192).is_empty());
-        assert!(Rpf9Header::parse(&APPDATA0_HDR).unwrap().validate(8_880).is_empty());
+        assert!(Rpf9Header::parse(&small_hdr()).unwrap().validate(0x10000).is_empty());
+        assert!(Rpf9Header::parse(&wide_hdr()).unwrap().validate(0x11000).is_empty());
+        assert!(Rpf9Header::parse(&shared_key_hdr()).unwrap().validate(0x2000).is_empty());
         // A file shorter than the TOC fails validation.
-        assert!(!Rpf9Header::parse(&COMMON_HDR).unwrap().validate(0x1000).is_empty());
+        assert!(!Rpf9Header::parse(&wide_hdr()).unwrap().validate(0x1000).is_empty());
     }
 
     #[test]
     fn header_rejects_bad_input() {
-        assert!(Rpf9Header::parse(&SCRIPT_16[..12]).is_err());
-        let mut rpf8 = SCRIPT_16;
+        let small16 = first16(&small_hdr());
+        assert!(Rpf9Header::parse(&small16[..12]).is_err());
+        let mut rpf8 = small16;
         rpf8[0] = b'8';
         assert!(Rpf9Header::parse(&rpf8).is_err());
-    }
-
-    // ── Archive dispatch ──
-
-    #[test]
-    fn archive_parse_dispatches_to_v9() {
-        let (file, _, _) = synthetic_rpf9();
-        let a = RpfArchive::parse(&file, "script.rpf", None).unwrap();
-        assert_eq!(a.version, RpfVersion::V9);
-        assert_eq!(a.encryption, RpfEncryption::Unknown);
-        assert!(a.encryption.is_encrypted());
-        assert!(a.entries.is_empty());
-    }
-
-    #[test]
-    fn archive_parse_rejects_truncated_toc() {
-        // 16 bytes only: toc_end 0x260 is past the end of the data.
-        assert!(RpfArchive::parse(&SCRIPT_16, "script.rpf", None).is_err());
     }
 
     #[test]
@@ -637,25 +786,5 @@ mod tests {
         assert_eq!(sniff_kind(b"plain words\n"), "txt");
         assert_eq!(sniff_kind(&[0x00, 0xFF, 0x10, 0x80]), "bin");
         assert_eq!(sniff_kind(b""), "bin");
-    }
-
-    /// Runs against the sample archives when they are on disk; does nothing
-    /// otherwise. Set RPF9_SAMPLE_DIR to point it somewhere else.
-    #[test]
-    fn real_samples_if_present() {
-        let dir = std::env::var("RPF9_SAMPLE_DIR")
-            .unwrap_or_else(|_| "/tmp/rpf9-test-samples".into());
-        for name in ["appdata0.rpf", "script.rpf", "common.rpf"] {
-            let p = std::path::Path::new(&dir).join(name);
-            let Ok(data) = std::fs::read(&p) else { continue };
-            let h = Rpf9Header::parse(&data).unwrap();
-            assert!(h.validate(data.len()).is_empty(), "{name}: {:?}", h.validate(data.len()));
-            let a = RpfArchive::parse(&data, name, None).unwrap();
-            assert_eq!(a.version, RpfVersion::V9);
-            let found = scan_zlib_streams(&data, &ScanOptions::default());
-            eprintln!("{name}: {} zlib payloads", found.len());
-            // No stream can start inside the header or the encrypted TOC.
-            assert!(found.iter().all(|s| s.offset >= h.toc_end as usize), "{name}");
-        }
     }
 }

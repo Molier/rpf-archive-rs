@@ -145,7 +145,7 @@ std::fs::write("player.img", img_data)?;
 ```rust
 use rpf_archive::{scan_zlib_streams, Rpf9Header, ScanOptions};
 
-let data = std::fs::read("common.rpf")?;
+let data = std::fs::read("archive.rpf")?;
 let header = Rpf9Header::parse(&data)?;       // toc_end, field_24, key_hash, ...
 for s in scan_zlib_streams(&data, &ScanOptions::default()) {
     println!("{:#x} {} blocks -> {} bytes ({})", s.offset, s.blocks, s.data.len(), s.kind());
@@ -160,15 +160,12 @@ and dump the payloads from the command line:
 
 What RPF9 support still lacks:
 
-- TOC decryption. The 0x40-byte header is plaintext and everything from
-  0x40 to `toc_end` has 7.7 to 8.0 bits/byte of entropy. Nobody has tried
-  the RPF7 AES/NG schemes on it yet. Candidate key inputs are `archive_id`
-  (0x10, different in every archive) and `key_hash` (0x28, shared by some
-  archives).
+- TOC decryption. The 0x40-byte header is plaintext; the TOC from 0x40 to
+  `toc_end` is high entropy and is not decrypted. Candidate key inputs are
+  `archive_id` (0x10) and `key_hash` (0x28).
 - Names, directory structure and entry kinds, which all live in the TOC.
-- Payloads that aren't plain zlib. Most of `script.rpf` and all of
-  `appdata0.rpf`'s data area are high entropy with no zlib header, so they
-  are probably encrypted.
+- Payloads that aren't plain zlib. Some data areas are high entropy with no
+  zlib header, so they are probably encrypted.
 - Writing.
 
 The header field layout, and what is known about each field, is in the
