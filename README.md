@@ -26,6 +26,12 @@ rpf-archive = "0.10"
 | RPF6 | Red Dead Redemption | `RPF6` | yes | yes |
 | RPF7 | GTA V / FiveM | `RPF7` | yes | yes |
 | RPF8 | Red Dead Redemption 2 | `RPF8` | yes | |
+| RPF9 | GTA VI | `9FPR` | header + zlib carving | |
+
+RPF9 is read only in part: its table of contents is encrypted with a scheme
+the crate doesn't know. `RpfArchive::parse` reads the header and returns no
+entries, with `RpfEncryption::Unknown`. `scan_zlib_streams` carves out the
+file bodies that are plain zlib, with no names attached (see below).
 
 ## What the crate covers
 
@@ -134,6 +140,40 @@ std::fs::write("player.dir", dir_data)?;
 std::fs::write("player.img", img_data)?;
 ```
 
+### Carving an RPF9 archive (no TOC)
+
+```rust
+use rpf_archive::{scan_zlib_streams, Rpf9Header, ScanOptions};
+
+let data = std::fs::read("common.rpf")?;
+let header = Rpf9Header::parse(&data)?;       // toc_end, field_24, key_hash, ...
+for s in scan_zlib_streams(&data, &ScanOptions::default()) {
+    println!("{:#x} {} blocks -> {} bytes ({})", s.offset, s.blocks, s.data.len(), s.kind());
+}
+```
+
+Every stream returned passed the Adler-32 check, so its data is intact.
+Files over 64 KiB are stored as chains of 64 KiB zlib blocks on 16-byte
+boundaries; the scanner joins those into one payload. To print the header
+and dump the payloads from the command line:
+`cargo run --release --example rpf9_scan -- FILE [OUT_DIR]`.
+
+What RPF9 support still lacks:
+
+- TOC decryption. The 0x40-byte header is plaintext and everything from
+  0x40 to `toc_end` has 7.7 to 8.0 bits/byte of entropy. Nobody has tried
+  the RPF7 AES/NG schemes on it yet. Candidate key inputs are `archive_id`
+  (0x10, different in every archive) and `key_hash` (0x28, shared by some
+  archives).
+- Names, directory structure and entry kinds, which all live in the TOC.
+- Payloads that aren't plain zlib. Most of `script.rpf` and all of
+  `appdata0.rpf`'s data area are high entropy with no zlib header, so they
+  are probably encrypted.
+- Writing.
+
+The header field layout, and what is known about each field, is in the
+module docs of `src/rpf9.rs`.
+
 ### Directory tree
 
 ```rust
@@ -152,6 +192,7 @@ src/
   writer.rs     RpfBuilder, and rage_joaat for entry name hashes
   tree.rs       directory tree over a parsed archive
   dlc.rs        dlclist.xml / setup2.xml load order
+  rpf9.rs       RPF9 header, zlib stream scanner and their tests
   tests.rs      write-then-read round trips for every version
 ```
 

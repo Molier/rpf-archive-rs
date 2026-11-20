@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn real_samples_if_present() {
         let dir = std::env::var("RPF9_SAMPLE_DIR")
-            .unwrap_or_else(|_| "/opt/gta6-analysis/extracted/torrent_files".into());
+            .unwrap_or_else(|_| "/tmp/rpf9-test-samples".into());
         for name in ["appdata0.rpf", "script.rpf", "common.rpf"] {
             let p = std::path::Path::new(&dir).join(name);
             let Ok(data) = std::fs::read(&p) else { continue };
